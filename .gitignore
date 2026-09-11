@@ -1,0 +1,5 @@
+episodes
+emails
+.DS_Store
+.venv
+__pycache__
