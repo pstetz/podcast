@@ -194,8 +194,8 @@ def load_msg(path):
     return subject, html, plain, date
 
 
-def build_script(subject, html, plain):
-    """Return the full spoken text for one episode."""
+def _spoken_sentences(subject, html, plain):
+    """Return the episode's sentences in reading order (subject line first)."""
     if html:
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["style", "script"]):
@@ -216,7 +216,53 @@ def build_script(subject, html, plain):
         if title:
             spoken.append(title + ".")
         spoken.extend(sentences)
-    return " ".join(spoken)
+    return spoken
+
+
+def build_script(subject, html, plain):
+    """Return the full spoken text for one episode."""
+    return " ".join(_spoken_sentences(subject, html, plain))
+
+
+QUOTE_ATTRIBUTION_RE = re.compile(
+    r"\b(said|says|wrote|writes|noted|notes|according to|told|argues|argued|claims|claimed)\b",
+    re.IGNORECASE,
+)
+_OPEN_QUOTES = "\"“"
+_CLOSE_QUOTES = "\"”"
+
+
+def _quoted_span_length(sentence):
+    return sum(len(m.group(1)) for m in re.finditer(r'["“]([^"”]{15,})["”]', sentence))
+
+
+def is_quote_sentence(sentence):
+    """Heuristic: a sentence that IS a quote (fully wrapped in quote marks),
+    or one where a large quoted span carries an attribution word nearby
+    ('X said "..."', 'according to the complaint, "..."')."""
+    s = sentence.strip()
+    if not s:
+        return False
+    if s[0] in _OPEN_QUOTES and s[-1] in _CLOSE_QUOTES:
+        return True
+    quoted_len = _quoted_span_length(s)
+    if quoted_len and quoted_len / len(s) > 0.5 and QUOTE_ATTRIBUTION_RE.search(s):
+        return True
+    return False
+
+
+def build_script_segments(subject, html, plain):
+    """Return [(voice_tag, text), ...] with consecutive same-tag sentences
+    merged into one segment, voice_tag in {"narrator", "quote"}. Used to
+    drive per-segment voice switching (Kokoro only)."""
+    segments = []
+    for sentence in _spoken_sentences(subject, html, plain):
+        tag = "quote" if is_quote_sentence(sentence) else "narrator"
+        if segments and segments[-1][0] == tag:
+            segments[-1] = (tag, segments[-1][1] + " " + sentence)
+        else:
+            segments.append((tag, sentence))
+    return segments
 
 
 def slugify(text):
@@ -248,18 +294,37 @@ def _get_kokoro_pipeline(voice):
     return _kokoro_pipeline
 
 
-def synthesize_kokoro_sync(text, out_path, voice, speed=1.0):
+def synthesize_kokoro_sync(segments, out_path, narrator_voice, quote_voice, speed=1.0):
     """Runs Kokoro (a local model, not a network call) — kept synchronous
-    and called via asyncio.to_thread so it doesn't block other episodes."""
+    and called via asyncio.to_thread so it doesn't block other episodes.
+
+    segments: [(voice_tag, text), ...] as produced by build_script_segments.
+    Each segment is synthesized with its own voice (quote segments use
+    quote_voice, everything else uses narrator_voice) and the resulting
+    audio is concatenated, with a short silence at every voice switch so
+    the cut isn't abrupt."""
     import numpy as np
-    pipeline = _get_kokoro_pipeline(voice)
-    chunks = []
-    for result in pipeline(text, voice=voice, speed=speed):
-        if result.audio is not None:
-            chunks.append(result.audio.numpy())
-    if not chunks:
+    voice_for_tag = {"narrator": narrator_voice, "quote": quote_voice}
+    silence_gap = np.zeros(int(24000 * 0.35), dtype=np.float32)
+
+    all_chunks = []
+    for tag, text in segments:
+        voice = voice_for_tag[tag]
+        pipeline = _get_kokoro_pipeline(voice)
+        seg_chunks = [
+            result.audio.numpy()
+            for result in pipeline(text, voice=voice, speed=speed)
+            if result.audio is not None
+        ]
+        if not seg_chunks:
+            continue
+        if all_chunks:
+            all_chunks.append(silence_gap)
+        all_chunks.extend(seg_chunks)
+
+    if not all_chunks:
         raise RuntimeError("Kokoro produced no audio for this text")
-    audio = np.concatenate(chunks)
+    audio = np.concatenate(all_chunks)
 
     wav_path = out_path.with_suffix(".wav")
     sf.write(str(wav_path), audio, 24000)  # Kokoro outputs 24kHz
@@ -273,8 +338,8 @@ def synthesize_kokoro_sync(text, out_path, voice, speed=1.0):
     wav_path.unlink(missing_ok=True)
 
 
-async def synthesize_kokoro(text, out_path, voice, speed=1.0):
-    await asyncio.to_thread(synthesize_kokoro_sync, text, out_path, voice, speed)
+async def synthesize_kokoro(segments, out_path, narrator_voice, quote_voice, speed=1.0):
+    await asyncio.to_thread(synthesize_kokoro_sync, segments, out_path, narrator_voice, quote_voice, speed)
 
 
 def tag_mp3(path, title, artist="Money Stuff", album="Money Stuff (audio)", track=None, lyrics=None):
@@ -309,8 +374,15 @@ def load_email_file(path):
     return None
 
 
-async def process_file(path, subject, html, plain, date, out_dir, engine, voice, rate, speed, track=None):
-    text = build_script(subject, html, plain)
+async def process_file(path, subject, html, plain, date, out_dir, engine, voice, rate, speed,
+                        quote_voice=None, track=None):
+    if engine == "kokoro":
+        segments = build_script_segments(subject, html, plain)
+        text = " ".join(s for _, s in segments)
+    else:
+        segments = None
+        text = build_script(subject, html, plain)
+
     if len(text) < 40:
         print(f"  skipped {path.name}: not enough text extracted")
         return None
@@ -323,7 +395,10 @@ async def process_file(path, subject, html, plain, date, out_dir, engine, voice,
     print(f"  {path.name}  ->  {out_name}  ({len(text)} chars)")
 
     if engine == "kokoro":
-        await synthesize_kokoro(text, out_path, voice, speed)
+        quote_count = sum(1 for tag, _ in segments if tag == "quote")
+        if quote_count:
+            print(f"    {quote_count} quoted segment(s) will use voice '{quote_voice}'")
+        await synthesize_kokoro(segments, out_path, voice, quote_voice or voice, speed)
     else:
         await synthesize(text, out_path, voice, rate)
 
@@ -390,7 +465,7 @@ async def run(args):
             try:
                 await process_file(path, subject, html, plain, date, out_dir,
                                     args.engine, args.voice, args.rate, args.speed,
-                                    track=track)
+                                    quote_voice=args.quote_voice, track=track)
             except Exception as e:
                 print(f"  ERROR on {path.name}: {e}")
 
@@ -424,6 +499,12 @@ def main():
                          help="[edge only] Speech rate, e.g. +10%%, -15%%")
     parser.add_argument("--speed", type=float, default=1.0,
                          help="[kokoro only] Speed multiplier, e.g. 1.1")
+    parser.add_argument("--quote-voice", default=None,
+                         help="[kokoro only] Voice for quoted/attributed text, e.g. "
+                              "'someone said, \"...\"' or a quoted filing excerpt — read in "
+                              "this voice instead of --voice so quotes are audibly distinct. "
+                              "Defaults to 'am_michael'. Pass the same value as --voice "
+                              "to disable voice-switching.")
     parser.add_argument("--limit", type=int, default=None,
                          help="Only process the first N files (good for testing)")
     parser.add_argument("--concurrency", type=int, default=3,
@@ -434,6 +515,8 @@ def main():
 
     if args.voice is None:
         args.voice = "af_heart" if args.engine == "kokoro" else "en-US-AndrewNeural"
+    if args.engine == "kokoro" and args.quote_voice is None:
+        args.quote_voice = "am_michael"
 
     if args.list_voices:
         asyncio.run(list_voices())

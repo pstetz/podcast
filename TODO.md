@@ -1,31 +1,21 @@
 # Future work
 
 Not implemented yet — logged here per request instead of rushed. Existing
-episodes in `episodes/` should not be touched by either of these; only test
-against emails that haven't been converted yet.
+episodes in `episodes/` should not be touched; only test against emails
+that haven't been converted yet.
 
-## 1. Multi-voice narration (detect quoted speech, switch voice)
+Multi-voice narration for quoted/attributed text (Kokoro only) is done —
+see `build_script_segments`, `is_quote_sentence`, and the `--quote-voice`
+flag in `newsletter_to_podcast.py`. Current heuristic: a sentence fully
+wrapped in quote marks, or one with a large quoted span plus a nearby
+attribution word (said/wrote/according to/etc.), is read in `--quote-voice`
+(default `am_michael`) instead of the narrator voice. Known gap: quotes
+that span multiple sentences without per-sentence quote marks (e.g. a
+block excerpt from a filing formatted as its own paragraph) aren't
+detected — would need an HTML-level check (blockquote/indented block) to
+catch those.
 
-Goal: when the newsletter text quotes another person/article, read that
-span in a second voice instead of the narrator voice.
-
-Rough approach:
-- In `build_script`/a new pass, split each sentence into (speaker, text)
-  segments. Heuristic: text inside `"..."` or `“...”` that is preceded/
-  followed by an attribution pattern (`, X said`, `X said,`, `according to
-  X`, etc.) gets tagged as "quote"; everything else is "narrator".
-- Kokoro (`synthesize_kokoro_sync`) already takes a `voice` param per call —
-  synthesize narrator segments with `af_bella` and quote segments with a
-  second voice (e.g. `am_michael`), then concatenate the resulting audio
-  arrays in order before writing the mp3 (silence gap between segments to
-  avoid clipped transitions).
-- Edge case to watch: Money Stuff quotes long block excerpts from other
-  articles/filings — those should probably also switch voice even without
-  a "X said" attribution right next to them (may need a simpler heuristic:
-  any blockquote/indented HTML block = quote voice).
-- Test only on not-yet-converted episodes before considering it done.
-
-## 2. iOS listening app
+## iOS listening app
 
 Goal: an app (or lightweight web app) that:
 - Plays the mp3 episodes
